@@ -1,0 +1,15 @@
+# monitoring/grafana/dashboards/dashboards.yml
+# Auto-provision dashboards from JSON files in this directory
+
+apiVersion: 1
+
+providers:
+  - name: '8byte-dashboards'
+    orgId: 1
+    folder: '8byte DevOps'
+    type: file
+    disableDeletion: false
+    updateIntervalSeconds: 30
+    allowUiUpdates: true
+    options:
+      path: /etc/grafana/provisioning/dashboards

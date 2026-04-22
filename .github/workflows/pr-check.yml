@@ -1,0 +1,49 @@
+# ============================================================
+# .github/workflows/pr-check.yml
+# Lightweight check that runs on every PR — fast feedback
+# ============================================================
+
+name: PR Checks
+
+on:
+  pull_request:
+    branches: [main, develop]
+
+jobs:
+  lint-and-validate:
+    name: 🔍 Lint & Validate
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install deps
+        working-directory: app
+        run: npm ci
+
+      - name: Check for hardcoded secrets (gitleaks)
+        uses: gitleaks/gitleaks-action@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        continue-on-error: true
+
+      - name: Validate Dockerfile (hadolint)
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: Dockerfile
+
+      - name: Terraform format check
+        uses: hashicorp/setup-terraform@v3
+        with:
+          terraform_version: 1.7.0
+
+      - name: Terraform fmt
+        working-directory: terraform
+        run: terraform fmt -check -recursive

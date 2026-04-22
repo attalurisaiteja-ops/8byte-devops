@@ -1,0 +1,15 @@
+node_modules
+app/node_modules
+.git
+.gitignore
+*.log
+npm-debug.log*
+coverage/
+.env
+.env.*
+terraform/
+.github/
+monitoring/
+scripts/
+*.md
+docker-compose.yml

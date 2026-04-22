@@ -1,0 +1,143 @@
+# ============================================================
+# docker-compose.yml — Full local dev + monitoring stack
+# ============================================================
+version: '3.9'
+
+services:
+
+  # ── Application ─────────────────────────────────────────────
+  app:
+    build:
+      context: .
+      target: builder
+    ports:
+      - "3000:3000"
+    environment:
+      NODE_ENV: development
+      PORT: 3000
+      DB_HOST: postgres
+      DB_PORT: 5432
+      DB_NAME: appdb
+      DB_USER: dbadmin
+      DB_PASSWORD: localpassword
+    depends_on:
+      postgres:
+        condition: service_healthy
+    volumes:
+      - ./app/src:/app/src
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # ── PostgreSQL ───────────────────────────────────────────────
+  postgres:
+    image: postgres:15-alpine
+    environment:
+      POSTGRES_DB:       appdb
+      POSTGRES_USER:     dbadmin
+      POSTGRES_PASSWORD: localpassword
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./scripts/init.sql:/docker-entrypoint-initdb.d/init.sql
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U dbadmin -d appdb"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # ── Prometheus ──────────────────────────────────────────────
+  prometheus:
+    image: prom/prometheus:latest
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - ./monitoring/prometheus/alert_rules.yml:/etc/prometheus/alert_rules.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--storage.tsdb.retention.time=15d'
+      - '--web.enable-lifecycle'
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # ── Grafana ─────────────────────────────────────────────────
+  grafana:
+    image: grafana/grafana:latest
+    ports:
+      - "3001:3000"
+    environment:
+      GF_SECURITY_ADMIN_USER:     admin
+      GF_SECURITY_ADMIN_PASSWORD: admin123
+      GF_USERS_ALLOW_SIGN_UP:     "false"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./monitoring/grafana/dashboards:/etc/grafana/provisioning/dashboards
+      - ./monitoring/grafana/datasources:/etc/grafana/provisioning/datasources
+    depends_on:
+      - prometheus
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # ── Node Exporter (host metrics) ────────────────────────────
+  node-exporter:
+    image: prom/node-exporter:latest
+    ports:
+      - "9100:9100"
+    volumes:
+      - /proc:/host/proc:ro
+      - /sys:/host/sys:ro
+      - /:/rootfs:ro
+    command:
+      - '--path.procfs=/host/proc'
+      - '--path.rootfs=/rootfs'
+      - '--path.sysfs=/host/sys'
+      - '--collector.filesystem.mount-points-exclude=^/(sys|proc|dev|host|etc)($$|/)'
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # ── PostgreSQL Exporter (DB metrics) ───────────────────────
+  postgres-exporter:
+    image: prometheuscommunity/postgres-exporter:latest
+    ports:
+      - "9187:9187"
+    environment:
+      DATA_SOURCE_NAME: "postgresql://dbadmin:localpassword@postgres:5432/appdb?sslmode=disable"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    networks:
+      - app-network
+    restart: unless-stopped
+
+  # ── cAdvisor (container metrics) ────────────────────────────
+  cadvisor:
+    image: gcr.io/cadvisor/cadvisor:latest
+    ports:
+      - "8080:8080"
+    volumes:
+      - /:/rootfs:ro
+      - /var/run:/var/run:rw
+      - /sys:/sys:ro
+      - /var/lib/docker/:/var/lib/docker:ro
+    networks:
+      - app-network
+    restart: unless-stopped
+
+networks:
+  app-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  grafana_data:
+  prometheus_data:

@@ -1,0 +1,274 @@
+# ============================================================
+# .github/workflows/ci-cd.yml
+# Triggers: PR → test; merge to main → build+push+deploy staging
+# Manual approval gate before production deploy
+# ============================================================
+
+name: CI / CD Pipeline
+
+on:
+  pull_request:
+    branches: [main, develop]
+  push:
+    branches: [main]
+
+env:
+  AWS_REGION:    us-east-1
+  ECR_REPO_NAME: 8byte-devops-staging   # matches Terraform ECR name
+  ECS_CLUSTER:   8byte-devops-staging-cluster
+  ECS_SERVICE:   8byte-devops-staging-service
+  CONTAINER:     app
+
+jobs:
+  # ──────────────────────────────────────────────────────────
+  # JOB 1 — Run tests on every PR
+  # ──────────────────────────────────────────────────────────
+  test:
+    name: 🧪 Unit & Integration Tests
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_DB:       appdb
+          POSTGRES_USER:     dbadmin
+          POSTGRES_PASSWORD: testpassword
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Run unit tests
+        working-directory: app
+        env:
+          NODE_ENV:    test
+          DB_HOST:     localhost
+          DB_PORT:     5432
+          DB_NAME:     appdb
+          DB_USER:     dbadmin
+          DB_PASSWORD: testpassword
+        run: npm run test:ci
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: app/coverage/
+          retention-days: 7
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 2 — Security scanning
+  # ──────────────────────────────────────────────────────────
+  security-scan:
+    name: 🔒 Security Scan
+    runs-on: ubuntu-latest
+    needs: test
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js 20
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: app/package-lock.json
+
+      - name: Install dependencies
+        working-directory: app
+        run: npm ci
+
+      - name: Audit npm dependencies
+        working-directory: app
+        run: npm audit --audit-level=high
+        continue-on-error: true   # log but don't fail pipeline
+
+      - name: Run Trivy filesystem scan (dependencies)
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type:  'fs'
+          scan-ref:   './app'
+          severity:   'CRITICAL,HIGH'
+          format:     'table'
+          exit-code:  '1'
+        continue-on-error: true
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 3 — Build Docker image & push to ECR (main only)
+  # ──────────────────────────────────────────────────────────
+  build-and-push:
+    name: 🐳 Build & Push Docker Image
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    outputs:
+      image: ${{ steps.image-uri.outputs.image }}
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag & push image
+        id: image-uri
+        env:
+          REGISTRY:   ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG:  ${{ github.sha }}
+        run: |
+          IMAGE_URI="$REGISTRY/$ECR_REPO_NAME:$IMAGE_TAG"
+          docker build -t "$IMAGE_URI" .
+          docker push  "$IMAGE_URI"
+          # Also tag as latest
+          docker tag  "$IMAGE_URI" "$REGISTRY/$ECR_REPO_NAME:latest"
+          docker push "$REGISTRY/$ECR_REPO_NAME:latest"
+          echo "image=$IMAGE_URI" >> "$GITHUB_OUTPUT"
+
+      - name: Scan pushed image with Trivy
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref:  ${{ steps.image-uri.outputs.image }}
+          severity:   'CRITICAL,HIGH'
+          format:     'sarif'
+          output:     'trivy-results.sarif'
+        continue-on-error: true
+
+      - name: Upload Trivy SARIF
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-results.sarif
+        continue-on-error: true
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 4 — Deploy to STAGING
+  # ──────────────────────────────────────────────────────────
+  deploy-staging:
+    name: 🚀 Deploy → Staging
+    runs-on: ubuntu-latest
+    needs: build-and-push
+    environment: staging
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Download current task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_CLUSTER }} \
+            --query taskDefinition \
+            > task-def.json
+
+      - name: Update image in task definition
+        id: task-def
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def.json
+          container-name:  ${{ env.CONTAINER }}
+          image:           ${{ needs.build-and-push.outputs.image }}
+
+      - name: Deploy to ECS staging
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition:  ${{ steps.task-def.outputs.task-definition }}
+          service:          ${{ env.ECS_SERVICE }}
+          cluster:          ${{ env.ECS_CLUSTER }}
+          wait-for-service-stability: true
+
+      - name: Notify Slack — staging deployed
+        if: always()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅' || '❌' }} *Staging deploy ${{ job.status }}*\nCommit: `${{ github.sha }}`\nAuthor: ${{ github.actor }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+
+  # ──────────────────────────────────────────────────────────
+  # JOB 5 — Manual approval + Deploy to PRODUCTION
+  # ──────────────────────────────────────────────────────────
+  deploy-production:
+    name: 🏭 Deploy → Production (Manual Approval)
+    runs-on: ubuntu-latest
+    needs: deploy-staging
+    environment: production    # GitHub env with required reviewers = manual gate
+
+    env:
+      ECS_CLUSTER_PROD:  8byte-devops-production-cluster
+      ECS_SERVICE_PROD:  8byte-devops-production-service
+
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id:     ${{ secrets.AWS_ACCESS_KEY_ID_PROD }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY_PROD }}
+          aws-region:            ${{ env.AWS_REGION }}
+
+      - name: Download current production task definition
+        run: |
+          aws ecs describe-task-definition \
+            --task-definition ${{ env.ECS_CLUSTER_PROD }} \
+            --query taskDefinition \
+            > task-def-prod.json
+
+      - name: Update image in task definition
+        id: task-def-prod
+        uses: aws-actions/amazon-ecs-render-task-definition@v1
+        with:
+          task-definition: task-def-prod.json
+          container-name:  ${{ env.CONTAINER }}
+          image:           ${{ needs.build-and-push.outputs.image }}
+
+      - name: Deploy to ECS production
+        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
+        with:
+          task-definition:  ${{ steps.task-def-prod.outputs.task-definition }}
+          service:          ${{ env.ECS_SERVICE_PROD }}
+          cluster:          ${{ env.ECS_CLUSTER_PROD }}
+          wait-for-service-stability: true
+
+      - name: Notify Slack — production deployed
+        if: always()
+        uses: slackapi/slack-github-action@v1.26.0
+        with:
+          payload: |
+            {
+              "text": "${{ job.status == 'success' && '✅' || '❌' }} *PRODUCTION deploy ${{ job.status }}*\nCommit: `${{ github.sha }}`\nAuthor: ${{ github.actor }}\n<${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}|View Run>"
+            }
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
